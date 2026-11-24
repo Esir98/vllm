@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -61,6 +62,18 @@ class HiSparseConnectorMetadata(KVConnectorMetadata):
     row_mirrors: dict[str, tuple[SparseKVRowMirror, ...]]
     all_context_pages_resident: bool
     residency_updates: dict[str, SparseKVResidencyUpdate]
+    # Positive proofs for possible prefill rows when the batch-wide flag is false.
+    resident_prefill_request_ids: tuple[str, ...] = ()
+
+    def resident_prefill_suffix(self, request_ids: Sequence[str] | None) -> range:
+        """Proven resident rows at the end of the worker's query batch."""
+        if not self.resident_prefill_request_ids or request_ids is None:
+            return range(0)
+        resident = set(self.resident_prefill_request_ids)
+        end = start = len(request_ids)
+        while start and request_ids[start - 1] in resident:
+            start -= 1
+        return range(start, end)
 
 
 @dataclass
@@ -190,15 +203,29 @@ class HiSparseConnectorScheduler:
                     ),
                 ),
             )
+        all_resident = self.coordinator.all_context_pages_resident(scheduled_requests)
+        resident_prefill_ids: tuple[str, ...] = ()
+        if not all_resident and len(scheduled_requests) > 1:
+            # Backends partition query rows independently. Include prompt chunks
+            # and multi-token extends, without rescanning spilled ordinary decodes.
+            resident_prefill_ids = tuple(
+                req_id
+                for req_id, start, count in scheduled_requests
+                if (count > 1 or start < self.requests[req_id].num_prompt_tokens)
+                and self.coordinator.all_context_pages_resident(
+                    ((req_id, start, count),)
+                )
+            )
         return HiSparseConnectorMetadata(
             command,
             host_block_copies,
             tuple(source_block_ids),
             row_mirrors,
-            self.coordinator.all_context_pages_resident(scheduled_requests),
+            all_resident,
             self.coordinator.take_residency_updates(
                 scheduler_output.num_scheduled_tokens
             ),
+            resident_prefill_ids,
         )
 
     def update_connector_output(self, connector_output: KVConnectorOutput) -> None:
@@ -355,6 +382,7 @@ class HiSparseConnector(KVConnectorBase_V1, SupportsHMA):
             request_state_indices,
             request_ids,
             num_tokens=int(kwargs.get("num_tokens") or 0),
+            attention_request_ids=kwargs.get("attention_request_ids", request_ids),
         )
         self.connector_worker.prepare_forward(attn_metadata)
 

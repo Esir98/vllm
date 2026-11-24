@@ -410,6 +410,7 @@ class HiSparseConnectorWorker:
         request_state_indices: torch.Tensor | None,
         request_ids: list[str] | None = None,
         num_tokens: int = 0,
+        attention_request_ids: Sequence[str] | None = None,
     ) -> None:
         self._stage_row_mirror_mapping(num_tokens)
         self._finish_previous_step()
@@ -429,10 +430,14 @@ class HiSparseConnectorWorker:
         self._set_row_mirrors(mirrors)
         self._clear_forward_mirror_state()
         self._in_step = True
+        # Query rows may be reordered or partitioned independently of DMA rows.
+        prefill_rows = metadata.resident_prefill_suffix(attention_request_ids)
         for handle in self.cache_handles:
             handle.all_context_pages_resident = metadata.all_context_pages_resident
+            handle.resident_prefill_rows = prefill_rows
         for handle in self.kv_sharing_handles:
             handle.all_context_pages_resident = metadata.all_context_pages_resident
+            handle.resident_prefill_rows = prefill_rows
         self._copy_host_blocks(metadata.host_block_copies, previous_host_write_event)
         transfers = (
             metadata.command.page_transfers if metadata.command is not None else []

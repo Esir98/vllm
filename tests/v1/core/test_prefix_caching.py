@@ -428,7 +428,8 @@ def test_hisparse_reports_when_context_is_fully_resident():
     """A page the pool reuses under a host-reading request stops being resident."""
     manager = make_hisparse_kv_cache_manager(32, 16)
     tokens = list(range(4 * HISPARSE_BLOCK_SIZE))
-    request = make_request("request", tokens, HISPARSE_BLOCK_SIZE, sha256)
+    request = make_request("request", tokens[:-1], HISPARSE_BLOCK_SIZE, sha256)
+    request.append_output_token_ids(tokens[-1])
     assert _allocate_scheduled(manager, request, num_new_tokens=len(tokens)) is not None
     coordinator = get_hisparse_coordinator(manager)
     scheduled = ((request.request_id, len(tokens) - 1, 1),)
@@ -440,6 +441,10 @@ def test_hisparse_reports_when_context_is_fully_resident():
     _publish_hisparse_pages(manager)
     coordinator.take_residency_updates([request.request_id])
     core_row = manager.get_block_ids(request.request_id)[2]
+    prefill = make_request(
+        "prefill", [99] * HISPARSE_BLOCK_SIZE, HISPARSE_BLOCK_SIZE, sha256
+    )
+    assert _allocate_scheduled(manager, prefill, HISPARSE_BLOCK_SIZE)
     pool = manager.block_pool
     pool.get_new_blocks(pool.get_num_free_blocks())
 
@@ -453,6 +458,30 @@ def test_hisparse_reports_when_context_is_fully_resident():
     update = coordinator.take_residency_updates([request.request_id])
     assert update[request.request_id].pages == lost
     assert update[request.request_id].block_ids[0] == [0] * len(lost)
+
+    # The next mixed step can still read the other request's prompt in place.
+    scheduler = HiSparseConnectorScheduler(async_speculative=False)
+    scheduler.bind_coordinator(coordinator)
+    scheduler.requests = {req.request_id: req for req in (request, prefill)}
+    output = SchedulerOutput.make_empty()
+    output.scheduled_cached_reqs.req_ids = [request.request_id, prefill.request_id]
+    output.scheduled_cached_reqs.num_computed_tokens = [len(tokens) - 1, 0]
+    output.scheduled_cached_reqs.num_output_tokens = [1, 0]
+    output.scheduled_cached_reqs.new_block_ids = [None, None]
+    output.num_scheduled_tokens = {
+        request.request_id: 1,
+        prefill.request_id: HISPARSE_BLOCK_SIZE,
+    }
+    output.total_num_scheduled_tokens = sum(output.num_scheduled_tokens.values())
+    metadata = scheduler.build_connector_meta(output)
+    assert not metadata.all_context_pages_resident
+    assert metadata.resident_prefill_suffix(
+        [request.request_id, prefill.request_id]
+    ) == range(1, 2)
+    assert metadata.resident_prefill_suffix(
+        [prefill.request_id, request.request_id, prefill.request_id]
+    ) == range(2, 3)
+    assert not metadata.resident_prefill_suffix([prefill.request_id, "unknown"])
 
 
 def test_hisparse_residency_update_sends_only_changed_pages():

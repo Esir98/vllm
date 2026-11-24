@@ -1149,6 +1149,7 @@ class HiSparseCacheHandle:
         self.decode_batch = False
         self.prefetch_decode_group = False
         self.all_context_pages_resident = True
+        self.resident_prefill_rows = range(0)
         self.num_actual_tokens = 0
         self.num_decode_tokens = 0
         self.req_id_per_token: torch.Tensor | None = None
